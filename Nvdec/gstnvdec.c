@@ -103,6 +103,7 @@ gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
   if (!cuda_OK (cuInit (0)))
     GST_ERROR ("failed to init CUDA");
 
+  // Uses 0th device
   if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_AUTO, 0)))
     GST_ERROR ("failed to create CUDA context");
 
@@ -111,6 +112,8 @@ gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
 
   if (!cuda_OK (cuvidCtxLockCreate (&self->lock, self->context)))
     GST_ERROR ("failed to create CUDA context lock");
+
+  GST_DEBUG("Context created");
 }
 
 typedef struct _GstNvDecCudaGraphicsResourceInfo
@@ -242,8 +245,6 @@ G_DEFINE_TYPE_WITH_CODE (GstNvDec, gst_nvdec, GST_TYPE_VIDEO_DECODER,
 static void
 gst_nvdec_class_init (GstNvDecClass * klass)
 {
-  g_print("init\n");
-  GST_DEBUG("INIT");
   GstVideoDecoderClass *video_decoder_class = GST_VIDEO_DECODER_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
 
@@ -276,6 +277,56 @@ gst_nvdec_init (GstNvDec * nvdec)
   gst_video_decoder_set_packetized (GST_VIDEO_DECODER (nvdec), TRUE);
   gst_video_decoder_set_needs_format (GST_VIDEO_DECODER (nvdec), TRUE);
 }
+static const char * GetVideoChromaFormatString(cudaVideoChromaFormat eChromaFormat) {
+  static struct {
+    cudaVideoChromaFormat eChromaFormat;
+    const char *name;
+  } aChromaFormatName[] = {
+    { cudaVideoChromaFormat_Monochrome, "YUV 400 (Monochrome)" },
+  { cudaVideoChromaFormat_420,        "YUV 420" },
+  { cudaVideoChromaFormat_422,        "YUV 422" },
+  { cudaVideoChromaFormat_444,        "YUV 444" },
+  };
+
+  if (eChromaFormat >= 0 && eChromaFormat < sizeof(aChromaFormatName) / sizeof(aChromaFormatName[0])) {
+    return aChromaFormatName[eChromaFormat].name;
+  }
+  return "Unknown";
+}
+static const char * GetVideoCodecString(cudaVideoCodec eCodec) {
+  static struct {
+    cudaVideoCodec eCodec;
+    const char *name;
+  } aCodecName[] = {
+    { cudaVideoCodec_MPEG1,     "MPEG-1" },
+  { cudaVideoCodec_MPEG2,     "MPEG-2" },
+  { cudaVideoCodec_MPEG4,     "MPEG-4 (ASP)" },
+  { cudaVideoCodec_VC1,       "VC-1/WMV" },
+  { cudaVideoCodec_H264,      "AVC/H.264" },
+  { cudaVideoCodec_JPEG,      "M-JPEG" },
+  { cudaVideoCodec_H264_SVC,  "H.264/SVC" },
+  { cudaVideoCodec_H264_MVC,  "H.264/MVC" },
+  { cudaVideoCodec_HEVC,      "H.265/HEVC" },
+  { cudaVideoCodec_VP8,       "VP8" },
+  { cudaVideoCodec_VP9,       "VP9" },
+  { cudaVideoCodec_NumCodecs, "Invalid" },
+  { cudaVideoCodec_YUV420,    "YUV  4:2:0" },
+  { cudaVideoCodec_YV12,      "YV12 4:2:0" },
+  { cudaVideoCodec_NV12,      "NV12 4:2:0" },
+  { cudaVideoCodec_YUYV,      "YUYV 4:2:2" },
+  { cudaVideoCodec_UYVY,      "UYVY 4:2:2" },
+  };
+
+  if (eCodec >= 0 && eCodec <= cudaVideoCodec_NumCodecs) {
+    return aCodecName[eCodec].name;
+  }
+  for (int i = cudaVideoCodec_NumCodecs + 1; i < sizeof(aCodecName) / sizeof(aCodecName[0]); i++) {
+    if (eCodec == aCodecName[i].eCodec) {
+      return aCodecName[eCodec].name;
+    }
+  }
+  return "Unknown";
+}
 
 static gboolean
 parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
@@ -284,6 +335,22 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
   guint width, height;
   CUVIDDECODECREATEINFO create_info = { 0, };
   gboolean ret = TRUE;
+
+  CUVIDDECODECAPS decodecaps;
+  memset(&decodecaps, 0, sizeof(decodecaps));
+  decodecaps.eCodecType = format->codec;
+  decodecaps.eChromaFormat = format->chroma_format;
+  decodecaps.nBitDepthMinus8 = 0;
+
+  cuCtxPushCurrent(nvdec->cuda_context->context);
+  cuda_OK(cuvidGetDecoderCaps(&decodecaps));
+  cuCtxPopCurrent(NULL);
+
+  if (!decodecaps.bIsSupported) {
+    GST_ERROR_OBJECT(nvdec, "Format not supported! chroma: %s codec: %s",
+      GetVideoChromaFormatString(format->chroma_format), GetVideoCodecString(format->codec));
+    return FALSE;
+  }
 
   width = format->display_area.right - format->display_area.left;
   height = format->display_area.bottom - format->display_area.top;
@@ -311,10 +378,14 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     create_info.CodecType = format->codec;
     create_info.ChromaFormat = format->chroma_format;
     create_info.ulCreationFlags = cudaVideoCreate_Default;
+    //create_info.ulCreationFlags = cudaVideoCreate_PreferCUVID;
+    //create_info.ulCreationFlags = cudaVideoCreate_PreferDXVA;
+    //create_info.ulCreationFlags = cudaVideoCreate_PreferCUDA;
     create_info.display_area.left = format->display_area.left;
     create_info.display_area.top = format->display_area.top;
     create_info.display_area.right = format->display_area.right;
     create_info.display_area.bottom = format->display_area.bottom;
+    //create_info.OutputFormat = cudaVideoSurfaceFormat_NV12;
     create_info.OutputFormat = cudaVideoSurfaceFormat_NV12;
     create_info.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
     create_info.ulTargetWidth = width;
@@ -326,11 +397,19 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     create_info.target_rect.right = width;
     create_info.target_rect.bottom = height;
 
+    if (nvdec->decoder)
+      GST_WARNING_OBJECT(nvdec, "Already have decoder?");
+
+    cuCtxPushCurrent(nvdec->cuda_context->context);
     if (nvdec->decoder
         || !cuda_OK (cuvidCreateDecoder (&nvdec->decoder, &create_info))) {
       GST_ERROR_OBJECT (nvdec, "failed to create decoder");
       ret = FALSE;
     }
+    else {
+        GST_DEBUG_OBJECT (nvdec, "created decoder");
+    }
+    cuCtxPopCurrent(NULL);
 
     if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0))) {
       GST_ERROR_OBJECT (nvdec, "failed to unlock CUDA context");
@@ -391,6 +470,7 @@ static gboolean
 gst_nvdec_start (GstVideoDecoder * decoder)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
+  //g_print("Start\n");
 
   GST_DEBUG_OBJECT (nvdec, "creating CUDA context");
   nvdec->cuda_context = g_object_new (gst_nvdec_cuda_context_get_type (), NULL);
@@ -400,7 +480,31 @@ gst_nvdec_start (GstVideoDecoder * decoder)
     GST_ERROR_OBJECT (nvdec, "failed to create CUDA context or lock");
     return FALSE;
   }
-
+  /*
+  int nGpu = 0;
+  CUresult res = cuDeviceGetCount(&nGpu);
+  g_print("%i, Num gpus %i", res, nGpu);
+  CUdevice cuDevice = 0;
+  CUresult dev_res = cuDeviceGet(&cuDevice, 0);
+  g_print("Device made %i\n", dev_res);
+  CUcontext ctx = NULL;
+  CUresult context_res = cuCtxCreate(&ctx, 0, cuDevice);
+  g_print("Made context: %i\n", context_res);
+  CUVIDDECODECAPS decodeCaps = {0,};
+  decodeCaps.eCodecType = cudaVideoCodec_HEVC;
+  decodeCaps.eChromaFormat = cudaVideoChromaFormat_420;
+  decodeCaps.nBitDepthMinus8 = 0;
+  CUresult supported = cuvidGetDecoderCaps(&decodeCaps);
+  if (supported == CUDA_SUCCESS)
+    g_print("Supported!\n");
+  else
+    g_print("Not supported...  %i\n", supported);
+  if (decodeCaps.bIsSupported)
+    g_print("Really supported\n");
+  else
+    g_print("Not really supported\n");
+  cuCtxDestroy(ctx);
+  */
   return TRUE;
 }
 
@@ -502,14 +606,17 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   CUVIDPARSERPARAMS parser_params = { 0, };
 
   GST_DEBUG_OBJECT (nvdec, "set format");
+  //g_print("Set format\n");
 
   if (nvdec->input_state)
     gst_video_codec_state_unref (nvdec->input_state);
 
   nvdec->input_state = gst_video_codec_state_ref (state);
 
-  if (!maybe_destroy_decoder_and_parser (nvdec))
+  if (!maybe_destroy_decoder_and_parser(nvdec)) {
+    GST_WARNING_OBJECT(nvdec, "maybe destroy failed\n");
     return FALSE;
+  }
 
   s = gst_caps_get_structure (state->caps, 0);
   caps_name = gst_structure_get_name (s);
@@ -561,7 +668,11 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
     GST_ERROR_OBJECT (nvdec, "failed to create parser");
     return FALSE;
   }
+  else {
+    GST_DEBUG_OBJECT (nvdec, "Parser created");
+  }
 
+  GST_DEBUG_OBJECT (nvdec, "Set format worked");
   return TRUE;
 }
 
@@ -825,6 +936,7 @@ handle_pending_frames (GstNvDec * nvdec)
 
   g_list_free_full (list, (GDestroyNotify) gst_video_codec_frame_unref);
 
+  //g_print("Done handling frame %s\n", gst_flow_get_name(ret));
   return ret;
 }
 
@@ -894,7 +1006,7 @@ gst_nvdec_drain (GstVideoDecoder * decoder)
   packet.payload = NULL;
   packet.flags = CUVID_PKT_ENDOFSTREAM;
 
-  if (!cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
+  if (nvdec->parser && !cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
     GST_WARNING_OBJECT (nvdec, "parser failed");
 
   return handle_pending_frames (nvdec);
