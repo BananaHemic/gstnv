@@ -32,6 +32,7 @@
 #include <nvcuvid.h>
 
 G_BEGIN_DECLS
+#define USE_GL 0
 
 typedef struct _GstNvDecCudaContext GstNvDecCudaContext;
 typedef struct _GstNvDecCudaContextClass GstNvDecCudaContextClass;
@@ -65,9 +66,12 @@ struct _GstNvDec
 {
   GstVideoDecoder parent;
 
+  gboolean use_gl_output;
+#if USE_GL
   GstGLDisplay *gl_display;
   GstGLContext *gl_context;
   GstGLContext *other_gl_context;
+#endif
 
   GstNvDecCudaContext *cuda_context;
   CUvideoparser parser;
