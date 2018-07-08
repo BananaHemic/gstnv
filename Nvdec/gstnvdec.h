@@ -78,6 +78,7 @@ struct _GstNvDec
   CUvideodecoder decoder;
   GAsyncQueue *decode_queue;
 
+  guint num_decode_surfaces;
   guint width;
   guint height;
   guint fps_n;

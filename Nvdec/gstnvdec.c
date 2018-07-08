@@ -34,6 +34,12 @@
 #include <gst/gl/gstglfuncs.h>
 #include <cudaGL.h>
 
+// According to the NVCodec sample, 20 is the min for h264
+#define NUM_SURFACES_H264 20
+#define NUM_SURFACES_H265 20
+#define NUM_SURFACES_MPEG 20
+#define NUM_SURFACES_JPEG 1
+
 typedef enum
 {
   GST_NVDEC_QUEUE_ITEM_TYPE_SEQUENCE,
@@ -222,6 +228,7 @@ gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
   GST_DEBUG("Context created");
 }
 
+#if USE_GL
 static void
 register_cuda_resource (GstGLContext * context, gpointer * args)
 {
@@ -306,6 +313,7 @@ ensure_cuda_graphics_resource (GstMemory * mem,
 
   return cgr_info->resource;
 }
+#endif
 
 static void
 gst_nvdec_class_init (GstNvDecClass * klass)
@@ -377,7 +385,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     GST_DEBUG_OBJECT (nvdec, "creating decoder");
     create_info.ulWidth = width;
     create_info.ulHeight = height;
-    create_info.ulNumDecodeSurfaces = 20;
+    create_info.ulNumDecodeSurfaces = nvdec->num_decode_surfaces;
     create_info.CodecType = format->codec;
     create_info.ChromaFormat = format->chroma_format;
     create_info.ulCreationFlags = cudaVideoCreate_Default;
@@ -611,22 +619,26 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
           break;
       }
     }
+    nvdec->num_decode_surfaces = NUM_SURFACES_MPEG;
     if (!mpegversion) {
       GST_ERROR_OBJECT (nvdec, "could not get MPEG version");
       return FALSE;
     }
   } else if (!g_strcmp0 (caps_name, "video/x-h264")) {
     parser_params.CodecType = cudaVideoCodec_H264;
+    nvdec->num_decode_surfaces = NUM_SURFACES_H264;
   } else if (!g_strcmp0 (caps_name, "image/jpeg")) {
     parser_params.CodecType = cudaVideoCodec_JPEG;
+    nvdec->num_decode_surfaces = NUM_SURFACES_JPEG;
   } else if (!g_strcmp0 (caps_name, "video/x-h265")) {
     parser_params.CodecType = cudaVideoCodec_HEVC;
+    nvdec->num_decode_surfaces = NUM_SURFACES_H265;
   } else {
     GST_ERROR_OBJECT (nvdec, "failed to determine codec type");
     return FALSE;
   }
 
-  parser_params.ulMaxNumDecodeSurfaces = 20;
+  parser_params.ulMaxNumDecodeSurfaces = nvdec->num_decode_surfaces;
   parser_params.ulErrorThreshold = 100;
   parser_params.ulMaxDisplayDelay = 0;
   parser_params.ulClockRate = GST_SECOND;
@@ -673,6 +685,7 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   return TRUE;
 }
 
+#if USE_GL
 static void
 copy_video_frame_to_gl_textures (GstGLContext * context, gpointer * args)
 {
@@ -740,6 +753,7 @@ unlock_cuda_context:
   if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0)))
     GST_WARNING_OBJECT (nvdec, "failed to unlock CUDA context");
 }
+#endif
 
 static void
 copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, guint8 * dst_host) {
@@ -1193,6 +1207,8 @@ plugin_init(GstPlugin * plugin)
     //TODO check if NVDEC is supported before registering
   GST_DEBUG_CATEGORY_INIT(gst_nvdec_debug_category, "nvdec",
     0, "Template nvdec");
+
+  //return TRUE;
 
   return gst_element_register(plugin, "nvdec", GST_RANK_PRIMARY + 1,
     GST_TYPE_NVDEC);
