@@ -43,6 +43,7 @@ struct _GstNvDecCudaContext
 
   CUcontext context;
   CUvideoctxlock lock;
+  CUstream cudaStream;
 };
 
 struct _GstNvDecCudaContextClass

@@ -53,12 +53,14 @@ typedef struct _GstNvDecQueueItem
   gpointer data;
 } GstNvDecQueueItem;
 
+#if USE_GL
 typedef struct _GstNvDecCudaGraphicsResourceInfo
 {
   GstGLContext *gl_context;
   GstNvDecCudaContext *cuda_context;
   CUgraphicsResource resource;
 } GstNvDecCudaGraphicsResourceInfo;
+#endif
 
 GST_DEBUG_CATEGORY_STATIC (gst_nvdec_debug_category);
 #define GST_CAT_DEFAULT gst_nvdec_debug_category
@@ -190,6 +192,14 @@ gst_nvdec_cuda_context_finalize (GObject * object)
       GST_ERROR ("failed to destroy CUDA context lock");
   }
 
+  if (self->cudaStream) {
+      GST_DEBUG ("Destroying cuda stream");
+      if (cuda_OK (cuStreamDestroy (self->cudaStream)))
+          self->cudaStream = NULL;
+      else
+          GST_ERROR ("Failed to destroy the cuda stream");
+  }
+
   if (self->context) {
     GST_DEBUG ("destroying CUDA context");
     if (cuda_OK (cuCtxDestroy (self->context)))
@@ -218,6 +228,9 @@ gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
   // Uses 0th device
   if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_AUTO, 0)))
     GST_ERROR ("failed to create CUDA context");
+
+  if (!cuda_OK (cuStreamCreate (&(self->cudaStream), CU_STREAM_NON_BLOCKING)))
+      GST_ERROR ("Failed to create the cuda stream");
 
   if (!cuda_OK (cuCtxPopCurrent (NULL)))
     GST_ERROR ("failed to pop current CUDA context");
@@ -388,7 +401,8 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     create_info.ulNumDecodeSurfaces = nvdec->num_decode_surfaces;
     create_info.CodecType = format->codec;
     create_info.ChromaFormat = format->chroma_format;
-    create_info.ulCreationFlags = cudaVideoCreate_Default;
+    //create_info.ulCreationFlags = cudaVideoCreate_Default;
+    create_info.ulCreationFlags = cudaVideoCreate_PreferCUVID;
     create_info.display_area.left = format->display_area.left;
     create_info.display_area.top = format->display_area.top;
     create_info.display_area.right = format->display_area.right;
@@ -650,17 +664,21 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   parser_params.pfnDisplayPicture =
       (PFNVIDDISPLAYCALLBACK) parser_display_callback;
 
-  //TODO this should be in set format
   CUVIDDECODECAPS decodecaps;
   memset(&decodecaps, 0, sizeof(decodecaps));
   decodecaps.eCodecType = parser_params.CodecType;
   decodecaps.eChromaFormat = cudaVideoChromaFormat_420; // TODO support 4:4:4 output for jpeg 
   decodecaps.nBitDepthMinus8 = 0; //TODO support 10 bit
 
-  //TODO is the context push really needed?
-  cuCtxPushCurrent(nvdec->cuda_context->context);
-  cuda_OK(cuvidGetDecoderCaps(&decodecaps));
-  cuCtxPopCurrent(NULL);
+  if (!cuda_OK (cuCtxPushCurrent (nvdec->cuda_context->context))) {
+      return FALSE;
+  }
+  if (!cuda_OK (cuvidGetDecoderCaps (&decodecaps))) {
+      GST_ERROR_OBJECT (nvdec, "Failed to get decode caps");
+      return FALSE;
+  }
+  if (!cuda_OK (cuCtxPopCurrent (NULL)))
+      return FALSE;
 
   if (!decodecaps.bIsSupported) {
     GST_ERROR_OBJECT(nvdec, "Format not supported! chroma: %s codec: %s",
@@ -767,6 +785,7 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   proc_params.progressive_frame = dispinfo->progressive_frame;
   proc_params.top_field_first = dispinfo->top_field_first;
   proc_params.unpaired_field = dispinfo->repeat_first_field == -1;
+  proc_params.output_stream = nvdec->cuda_context->cudaStream;
 
   if (!cuda_OK (cuvidCtxLock (nvdec->cuda_context->lock, 0))) {
     GST_WARNING_OBJECT (nvdec, "failed to lock CUDA context");
@@ -788,8 +807,11 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   mcpy2d.dstHost = dst_host;
   mcpy2d.Height = nvdec->height;
 
+  cuCtxPushCurrent (nvdec->cuda_context->context);
+  //TODO there really only needs to be one memcpy
   // Copy the Y luminance
-  if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
+  //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
+  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cuda_context->cudaStream))){
     GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed");
   }
 
@@ -797,9 +819,15 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
     mcpy2d.srcDevice = (CUdeviceptr)(dptr + mcpy2d.srcPitch * mcpy2d.Height);
     mcpy2d.dstHost = (void*)(dst_host + mcpy2d.dstPitch * mcpy2d.Height);
     mcpy2d.Height = nvdec->height / 2; //TODO this assumes 420, which might not be the case for jpeg!
-  if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
+  //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
+  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cuda_context->cudaStream))){
     GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed");
   }
+
+  if (!cuda_OK (cuStreamSynchronize (nvdec->cuda_context->cudaStream))) {
+      GST_WARNING_OBJECT (nvdec, "Failed to syncronize the cuda stream");
+  }
+  cuCtxPopCurrent (NULL);
 
   if (!cuda_OK (cuvidUnmapVideoFrame (nvdec->decoder, dptr)))
     GST_WARNING_OBJECT (nvdec, "failed to unmap CUDA video frame");
@@ -1208,7 +1236,10 @@ plugin_init(GstPlugin * plugin)
   GST_DEBUG_CATEGORY_INIT(gst_nvdec_debug_category, "nvdec",
     0, "Template nvdec");
 
-  //return TRUE;
+  // Don't register this device if the user doesn't have an nvidia gpu
+  // nvcuvid is included in the display driver and is the dll for nvdec
+  //if (LoadLibraryA ("nvcuvid.dll") == NULL)
+      //return TRUE;
 
   return gst_element_register(plugin, "nvdec", GST_RANK_PRIMARY + 1,
     GST_TYPE_NVDEC);
