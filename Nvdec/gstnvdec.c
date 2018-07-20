@@ -33,6 +33,7 @@
 
 #include <gst/gl/gstglfuncs.h>
 #include <cudaGL.h>
+#include <windows.h>
 
 // According to the NVCodec sample, 20 is the min for h264
 #define NUM_SURFACES_H264 20
@@ -202,8 +203,10 @@ gst_nvdec_cuda_context_finalize (GObject * object)
 
   if (self->context) {
     GST_DEBUG ("destroying CUDA context");
-    if (cuda_OK (cuCtxDestroy (self->context)))
-      self->context = NULL;
+    if (cuda_OK (cuCtxDestroy (self->context))) {
+        self->context = NULL;
+        GST_WARNING ("Destroying ctx");
+    }
     else
       GST_ERROR ("failed to destroy CUDA context");
   }
@@ -220,15 +223,22 @@ gst_nvdec_cuda_context_class_init (GstNvDecCudaContextClass * klass)
 static void
 gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
 {
-    if (!cuda_OK (cuInit (0))) {
-        GST_ERROR ("failed to init CUDA");
-        return;
-    }
+    //if (!cuda_OK (cuInit (0))) {
+    //    GST_ERROR ("failed to init CUDA");
+    //    return;
+    //}
 
   // Uses 0th device
-  if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_AUTO, 0)))
-    GST_ERROR ("failed to create CUDA context");
+    //CUdevice device;
+    //cuDeviceGet (&device, 0);
+  //if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_AUTO, 0)))
+  //if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_YIELD, 0)))
+  //if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_YIELD, device)))
+  //if (!cuda_OK (cuCtxCreate (&(self->context), CU_CTX_SCHED_BLOCKING_SYNC, device)))
+  //if (!cuda_OK (cuCtxCreate (&(self->context), CU_CTX_SCHED_SPIN, device)))
+    //GST_ERROR ("failed to create CUDA context");
 
+/*
   if (!cuda_OK (cuStreamCreate (&(self->cudaStream), CU_STREAM_NON_BLOCKING)))
       GST_ERROR ("Failed to create the cuda stream");
 
@@ -239,6 +249,7 @@ gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
     GST_ERROR ("failed to create CUDA context lock");
 
   GST_DEBUG("Context created");
+  */
 }
 
 #if USE_GL
@@ -492,10 +503,84 @@ gst_nvdec_start (GstVideoDecoder * decoder)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
   g_print("Start\n");
+  GST_WARNING("Start");
+  LARGE_INTEGER li;
+  LARGE_INTEGER start;
+  LARGE_INTEGER end;
+  QueryPerformanceFrequency (&li);
+  double freq = ((double) li.QuadPart) / 1000.0;
+  LARGE_INTEGER totalStart;
+  QueryPerformanceCounter (&totalStart);
+  //DWORD totalStart = GetTickCount ();
+  g_print ("freq = %f\n", freq);
 
   GST_DEBUG_OBJECT (nvdec, "creating CUDA context");
+  QueryPerformanceCounter (&start);
+    if (!cuda_OK (cuInit (0))) {
+        GST_ERROR ("failed to init CUDA");
+        return FALSE;
+    }
+  QueryPerformanceCounter (&end);
+  double elapsed = (double)(end.QuadPart - start.QuadPart) / freq;
+  //DWORD end = GetTickCount ();
+  //DWORD elapsed = end - start;
+  //g_print ("cuinit Elapsed: %f ms\n", (double)elapsed);
+  GST_WARNING ("cuinit Elapsed: %f ms\n", (double)elapsed);
+
+  QueryPerformanceCounter (&start);
   nvdec->cuda_context = g_object_new (gst_nvdec_cuda_context_get_type (), NULL);
+  QueryPerformanceCounter (&end);
+  elapsed = (double)(end.QuadPart - start.QuadPart) / freq;
+  //g_print ("g_new Elapsed: %f ms\n", (double)elapsed);
+  GST_WARNING ("g_new Elapsed: %f ms\n", (double)elapsed);
+
+  QueryPerformanceCounter (&start);
+  cuCtxGetCurrent (&nvdec->cuda_context->context);
+  QueryPerformanceCounter (&end);
+  elapsed = (double)(end.QuadPart - start.QuadPart) / freq;
+  //g_print ("get curr Elapsed: %f ms\n", (double)elapsed);
+  GST_WARNING ("get curr Elapsed: %f ms\n", (double)elapsed);
+
+  QueryPerformanceCounter (&start);
+  int n_devs;
+  cuDeviceGetCount (&n_devs);
+  // Uses 0th device
+  CUdevice device;
+  cuDeviceGet (&device, 0);
+  QueryPerformanceCounter (&end);
+  elapsed = (double)(end.QuadPart - start.QuadPart) / freq;
+  GST_WARNING ("devs Elapsed: %f ms We have %i gpus\n", (double)elapsed, n_devs);
+
+  if (nvdec->cuda_context->context == NULL) {
+      GST_WARNING ("No current context, so we'll make one");
+      //DWORD start = GetTickCount ();
+      QueryPerformanceCounter (&start);
+      if (!cuda_OK (cuCtxCreate (&nvdec->cuda_context->context, CU_CTX_SCHED_AUTO, 0))) {
+          GST_WARNING ("Can't make ctx");
+          return FALSE;
+      }
+      //g_usleep (50 * 1000);
+      QueryPerformanceCounter (&end);
+      elapsed = (double)(end.QuadPart - start.QuadPart) / freq;
+      //DWORD end = GetTickCount ();
+      //DWORD elapsed = end - start;
+      //g_print ("ctx Elapsed: %f ms\n", (double)elapsed);
+      GST_WARNING ("ctx Elapsed: %f ms", (double)elapsed);
+      //g_usleep (300000);
+      nvdec->cuda_context->context = NULL;
+  }
+  else {
+      GST_WARNING ("Using existing context");
+  }
   nvdec->decode_queue = g_async_queue_new ();
+
+  LARGE_INTEGER totalEnd;
+  QueryPerformanceCounter (&totalEnd);
+  //DWORD totalEnd = GetTickCount ();
+  //DWORD totalElapsed = totalEnd - totalStart;
+  double totalElapsed = (totalEnd.QuadPart - totalStart.QuadPart) / freq;
+  //g_print ("total Elapsed: %f ms\n", (double)totalElapsed);
+  GST_WARNING ("total Elapsed: %f ms\n", (double)totalElapsed);
 
   if (!nvdec->cuda_context->context || !nvdec->cuda_context->lock) {
     GST_ERROR_OBJECT (nvdec, "failed to create CUDA context or lock");
@@ -657,13 +742,16 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   parser_params.ulMaxDisplayDelay = 0;
   parser_params.ulClockRate = GST_SECOND;
   parser_params.pUserData = nvdec;
+  /*
   parser_params.pfnSequenceCallback =
       (PFNVIDSEQUENCECALLBACK) parser_sequence_callback;
   parser_params.pfnDecodePicture =
       (PFNVIDDECODECALLBACK) parser_decode_callback;
   parser_params.pfnDisplayPicture =
       (PFNVIDDISPLAYCALLBACK) parser_display_callback;
+      */
 
+  /*
   CUVIDDECODECAPS decodecaps;
   memset(&decodecaps, 0, sizeof(decodecaps));
   decodecaps.eCodecType = parser_params.CodecType;
@@ -688,9 +776,11 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   else {
       GST_DEBUG_OBJECT (nvdec, "Format is supported");
   }
+  */
 
 
   GST_DEBUG_OBJECT (nvdec, "creating parser");
+  /*
   if (!cuda_OK (cuvidCreateVideoParser (&nvdec->parser, &parser_params))) {
     GST_ERROR_OBJECT (nvdec, "failed to create parser");
     return FALSE;
@@ -698,6 +788,7 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   else {
     GST_DEBUG_OBJECT (nvdec, "Parser created");
   }
+  */
 
   GST_DEBUG_OBJECT (nvdec, "Set format worked");
   return TRUE;
@@ -1052,6 +1143,7 @@ gst_nvdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   GstMapInfo map_info = GST_MAP_INFO_INIT;
   CUVIDSOURCEDATAPACKET packet = { 0, };
 
+  return GST_FLOW_ERROR;
   GST_LOG_OBJECT (nvdec, "handle frame");
 
   gst_video_codec_frame_set_user_data (frame, GUINT_TO_POINTER (0), NULL);
