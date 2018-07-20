@@ -47,6 +47,12 @@ typedef enum
   GST_NVDEC_QUEUE_ITEM_TYPE_DISPLAY
 } GstNvDecQueueItemType;
 
+enum
+{
+    PROP_0,
+    PROP_CTX
+};
+
 typedef struct _GstNvDecQueueItem
 {
   GstNvDecQueueItemType type;
@@ -65,7 +71,7 @@ typedef struct _GstNvDecCudaGraphicsResourceInfo
 GST_DEBUG_CATEGORY_STATIC (gst_nvdec_debug_category);
 #define GST_CAT_DEFAULT gst_nvdec_debug_category
 
-G_DEFINE_TYPE (GstNvDecCudaContext, gst_nvdec_cuda_context, G_TYPE_OBJECT);
+//G_DEFINE_TYPE (GstNvDecCudaContext, gst_nvdec_cuda_context, G_TYPE_OBJECT);
 
 static gboolean gst_nvdec_start (GstVideoDecoder * decoder);
 static gboolean gst_nvdec_stop (GstVideoDecoder * decoder);
@@ -82,6 +88,10 @@ static gboolean gst_nvdec_src_query (GstVideoDecoder * decoder,
 #endif
 static gboolean gst_nvdec_flush (GstVideoDecoder * decoder);
 static GstFlowReturn gst_nvdec_drain (GstVideoDecoder * decoder);
+static void gst_nvdec_set_property (GObject * object,
+    guint prop_id, const GValue * value, GParamSpec * pspec);
+static void gst_nvdec_get_property (GObject * object,
+    guint prop_id, GValue * value, GParamSpec * pspec);
 
 static GstStaticPadTemplate gst_nvdec_sink_template =
     GST_STATIC_PAD_TEMPLATE (GST_VIDEO_DECODER_SINK_NAME,
@@ -179,68 +189,6 @@ static const char * GetVideoCodecString(cudaVideoCodec eCodec) {
   return "Unknown";
 }
 
-static void
-gst_nvdec_cuda_context_finalize (GObject * object)
-{
-  GstNvDecCudaContext *self = (GstNvDecCudaContext *) object;
-
-  if (self->lock) {
-    GST_DEBUG ("destroying CUDA context lock");
-    if (cuda_OK (cuvidCtxLockDestroy (self->lock)))
-      self->lock = NULL;
-    else
-      GST_ERROR ("failed to destroy CUDA context lock");
-  }
-
-  if (self->cudaStream) {
-      GST_DEBUG ("Destroying cuda stream");
-      if (cuda_OK (cuStreamDestroy (self->cudaStream)))
-          self->cudaStream = NULL;
-      else
-          GST_ERROR ("Failed to destroy the cuda stream");
-  }
-
-  if (self->context) {
-    GST_DEBUG ("destroying CUDA context");
-    if (cuda_OK (cuCtxDestroy (self->context)))
-      self->context = NULL;
-    else
-      GST_ERROR ("failed to destroy CUDA context");
-  }
-
-  G_OBJECT_CLASS (gst_nvdec_cuda_context_parent_class)->finalize (object);
-}
-
-static void
-gst_nvdec_cuda_context_class_init (GstNvDecCudaContextClass * klass)
-{
-  G_OBJECT_CLASS (klass)->finalize = gst_nvdec_cuda_context_finalize;
-}
-
-static void
-gst_nvdec_cuda_context_init (GstNvDecCudaContext * self)
-{
-    if (!cuda_OK (cuInit (0))) {
-        GST_ERROR ("failed to init CUDA");
-        return;
-    }
-
-  // Uses 0th device
-  if (!cuda_OK (cuCtxCreate (&self->context, CU_CTX_SCHED_AUTO, 0)))
-    GST_ERROR ("failed to create CUDA context");
-
-  if (!cuda_OK (cuStreamCreate (&(self->cudaStream), CU_STREAM_NON_BLOCKING)))
-      GST_ERROR ("Failed to create the cuda stream");
-
-  if (!cuda_OK (cuCtxPopCurrent (NULL)))
-    GST_ERROR ("failed to pop current CUDA context");
-
-  if (!cuda_OK (cuvidCtxLockCreate (&self->lock, self->context)))
-    GST_ERROR ("failed to create CUDA context lock");
-
-  GST_DEBUG("Context created");
-}
-
 #if USE_GL
 static void
 register_cuda_resource (GstGLContext * context, gpointer * args)
@@ -333,6 +281,7 @@ gst_nvdec_class_init (GstNvDecClass * klass)
 {
   GstVideoDecoderClass *video_decoder_class = GST_VIDEO_DECODER_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
+  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
 
   gst_element_class_add_static_pad_template (element_class,
       &gst_nvdec_sink_template);
@@ -342,6 +291,9 @@ gst_nvdec_class_init (GstNvDecClass * klass)
   gst_element_class_set_static_metadata (element_class, "NVDEC video decoder",
       "Decoder/Video", "NVDEC video decoder",
       "Ericsson AB, http://www.ericsson.com");
+
+  gobject_class->set_property = gst_nvdec_set_property;
+  gobject_class->get_property = gst_nvdec_get_property;
 
   video_decoder_class->start = GST_DEBUG_FUNCPTR (gst_nvdec_start);
   video_decoder_class->stop = GST_DEBUG_FUNCPTR (gst_nvdec_stop);
@@ -359,6 +311,11 @@ gst_nvdec_class_init (GstNvDecClass * klass)
 #if USE_GL
   element_class->set_context = GST_DEBUG_FUNCPTR (gst_nvdec_set_context);
 #endif
+
+  g_object_class_install_property (gobject_class, PROP_CTX,
+      g_param_spec_uint64 ("context", "context",
+          "Cuda Context", 0, G_MAXUINT64, 0,
+          (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -366,6 +323,7 @@ gst_nvdec_init (GstNvDec * nvdec)
 {
   gst_video_decoder_set_packetized (GST_VIDEO_DECODER (nvdec), TRUE);
   gst_video_decoder_set_needs_format (GST_VIDEO_DECODER (nvdec), TRUE);
+  nvdec->did_make_context = FALSE;
 }
 
 static gboolean
@@ -381,7 +339,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
   GST_DEBUG_OBJECT (nvdec, "width: %u, height: %u", width, height);
 
   if (!nvdec->decoder || (nvdec->width != width || nvdec->height != height)) {
-    if (!cuda_OK (cuvidCtxLock (nvdec->cuda_context->lock, 0))) {
+    if (!cuda_OK (cuvidCtxLock (nvdec->lock, 0))) {
       GST_ERROR_OBJECT (nvdec, "failed to lock CUDA context");
       return FALSE;
     }
@@ -412,7 +370,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     create_info.ulTargetWidth = width;
     create_info.ulTargetHeight = height;
     create_info.ulNumOutputSurfaces = 1;
-    create_info.vidLock = nvdec->cuda_context->lock;
+    create_info.vidLock = nvdec->lock;
     create_info.target_rect.left = 0;
     create_info.target_rect.top = 0;
     create_info.target_rect.right = width;
@@ -421,7 +379,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     if (nvdec->decoder)
       GST_WARNING_OBJECT(nvdec, "Already have decoder?");
 
-    cuCtxPushCurrent(nvdec->cuda_context->context);
+    cuCtxPushCurrent(nvdec->context);
     if (nvdec->decoder
         || !cuda_OK (cuvidCreateDecoder (&nvdec->decoder, &create_info))) {
       GST_ERROR_OBJECT (nvdec, "failed to create decoder");
@@ -432,7 +390,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
     }
     cuCtxPopCurrent(NULL);
 
-    if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0))) {
+    if (!cuda_OK (cuvidCtxUnlock (nvdec->lock, 0))) {
       GST_ERROR_OBJECT (nvdec, "failed to unlock CUDA context");
       ret = FALSE;
     }
@@ -450,16 +408,17 @@ static gboolean
 parser_decode_callback (GstNvDec * nvdec, CUVIDPICPARAMS * params)
 {
   GstNvDecQueueItem *item;
+  //GST_DEBUG ("parser callback");
 
-  GST_LOG_OBJECT (nvdec, "picture index: %u", params->CurrPicIdx);
+  GST_DEBUG_OBJECT (nvdec, "decoded picture index: %u", params->CurrPicIdx);
 
-  if (!cuda_OK (cuvidCtxLock (nvdec->cuda_context->lock, 0)))
+  if (!cuda_OK (cuvidCtxLock (nvdec->lock, 0)))
     GST_WARNING_OBJECT (nvdec, "failed to lock CUDA context");
 
   if (!cuda_OK (cuvidDecodePicture (nvdec->decoder, params)))
     GST_WARNING_OBJECT (nvdec, "failed to decode picture");
 
-  if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0)))
+  if (!cuda_OK (cuvidCtxUnlock (nvdec->lock, 0)))
     GST_WARNING_OBJECT (nvdec, "failed to unlock CUDA context");
 
   item = g_slice_new (GstNvDecQueueItem);
@@ -477,7 +436,7 @@ parser_display_callback (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo)
 {
   GstNvDecQueueItem *item;
 
-  GST_LOG_OBJECT (nvdec, "picture index: %u", dispinfo->picture_index);
+  GST_DEBUG_OBJECT (nvdec, "display picture index: %u", dispinfo->picture_index);
 
   item = g_slice_new (GstNvDecQueueItem);
   item->type = GST_NVDEC_QUEUE_ITEM_TYPE_DISPLAY;
@@ -493,11 +452,63 @@ gst_nvdec_start (GstVideoDecoder * decoder)
   GstNvDec *nvdec = GST_NVDEC (decoder);
   g_print("Start\n");
 
-  GST_DEBUG_OBJECT (nvdec, "creating CUDA context");
-  nvdec->cuda_context = g_object_new (gst_nvdec_cuda_context_get_type (), NULL);
+  if (nvdec->context == NULL) {
+
+      GST_DEBUG_OBJECT (nvdec, "creating CUDA context");
+      if (!cuda_OK (cuInit (0))) {
+          GST_ERROR ("failed to init CUDA");
+          return FALSE;
+      }
+
+      CUdevice cuDevice;
+      if (!cuda_OK (cuDeviceGet (&cuDevice, 0)))
+          GST_ERROR ("Failed to get device");
+
+      // Uses 0th device
+      if (!cuda_OK (cuCtxCreate (&nvdec->context, CU_CTX_SCHED_AUTO, cuDevice)))
+          GST_ERROR ("failed to create CUDA context");
+      nvdec->did_make_context = TRUE;
+      GST_WARNING ("Made ctx, size %i %" G_GUINT64_FORMAT " device #%i", sizeof (CUcontext), nvdec->context, cuDevice);
+  }
+  else {
+      CUcontext current;
+      cuCtxGetCurrent (&current);
+
+      if (current == nvdec->context)
+          GST_DEBUG ("Ctx is current");
+      else
+          GST_WARNING ("Ctx is not current we have %" G_GUINT64_FORMAT, current);
+
+      if (!cuda_OK (cuCtxPushCurrent (nvdec->context))) {
+          GST_ERROR ("Failed pushing provided context");
+          return FALSE;
+      }
+      GST_WARNING ("Using provided context of %" G_GUINT64_FORMAT, nvdec->context);
+      cuCtxGetCurrent (&current);
+      if (current == nvdec->context)
+          GST_DEBUG ("Ctx is current");
+      else
+          GST_WARNING ("Ctx is not current we have " G_GUINT64_FORMAT, current);
+  }
+
+  if (!cuda_OK (cuStreamCreate (&(nvdec->cudaStream), CU_STREAM_NON_BLOCKING)))
+      GST_ERROR ("Failed to create the cuda stream");
+  GST_DEBUG ("Made cuda stream");
+
+  unsigned int version = 0;
+  cuCtxGetApiVersion (nvdec->context, &version);
+  GST_WARNING ("Using version %u", version);
+
+  if (!cuda_OK (cuCtxPopCurrent (NULL)))
+      GST_ERROR ("failed to pop current CUDA context");
+
+  if (!cuda_OK (cuvidCtxLockCreate (&nvdec->lock, nvdec->context)))
+      GST_ERROR ("failed to create CUDA context lock");
+  GST_WARNING ("Created lock");
+
   nvdec->decode_queue = g_async_queue_new ();
 
-  if (!nvdec->cuda_context->context || !nvdec->cuda_context->lock) {
+  if (!nvdec->context || !nvdec->lock) {
     GST_ERROR_OBJECT (nvdec, "failed to create CUDA context or lock");
     return FALSE;
   }
@@ -509,7 +520,7 @@ maybe_destroy_decoder_and_parser (GstNvDec * nvdec)
 {
   gboolean ret = TRUE;
 
-  if (!cuda_OK (cuvidCtxLock (nvdec->cuda_context->lock, 0))) {
+  if (!cuda_OK (cuvidCtxLock (nvdec->lock, 0))) {
     GST_ERROR_OBJECT (nvdec, "failed to lock CUDA context");
     return FALSE;
   }
@@ -523,7 +534,7 @@ maybe_destroy_decoder_and_parser (GstNvDec * nvdec)
       GST_ERROR_OBJECT (nvdec, "failed to destroy decoder");
   }
 
-  if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0))) {
+  if (!cuda_OK (cuvidCtxUnlock (nvdec->lock, 0))) {
     GST_ERROR_OBJECT (nvdec, "failed to unlock CUDA context");
     return FALSE;
   }
@@ -551,9 +562,29 @@ gst_nvdec_stop (GstVideoDecoder * decoder)
   if (!maybe_destroy_decoder_and_parser (nvdec))
     return FALSE;
 
-  if (nvdec->cuda_context) {
-    g_object_unref (nvdec->cuda_context);
-    nvdec->cuda_context = NULL;
+  if (nvdec->lock) {
+    GST_DEBUG ("destroying CUDA context lock");
+    if (cuda_OK (cuvidCtxLockDestroy (nvdec->lock)))
+      nvdec->lock = NULL;
+    else
+      GST_ERROR ("failed to destroy CUDA context lock");
+  }
+
+  if (nvdec->cudaStream) {
+      GST_DEBUG ("Destroying cuda stream");
+      if (cuda_OK (cuStreamDestroy (nvdec->cudaStream)))
+          nvdec->cudaStream = NULL;
+      else
+          GST_ERROR ("Failed to destroy the cuda stream");
+  }
+
+  if (nvdec->context && nvdec->did_make_context) {
+    GST_DEBUG ("destroying CUDA context");
+    if (cuda_OK (cuCtxDestroy (nvdec->context))) {
+        nvdec->context = NULL;
+        nvdec->did_make_context = FALSE;
+    } else
+      GST_ERROR ("failed to destroy CUDA context");
   }
 
 #if USE_GL
@@ -597,6 +628,8 @@ static gboolean
 gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
+  GST_WARNING ("set_f");
+
   GstStructure *s;
   const gchar *caps_name;
   gint mpegversion = 0;
@@ -670,7 +703,7 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   decodecaps.eChromaFormat = cudaVideoChromaFormat_420; // TODO support 4:4:4 output for jpeg 
   decodecaps.nBitDepthMinus8 = 0; //TODO support 10 bit
 
-  if (!cuda_OK (cuCtxPushCurrent (nvdec->cuda_context->context))) {
+  if (!cuda_OK (cuCtxPushCurrent (nvdec->context))) {
       return FALSE;
   }
   if (!cuda_OK (cuvidGetDecoderCaps (&decodecaps))) {
@@ -700,6 +733,7 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   }
 
   GST_DEBUG_OBJECT (nvdec, "Set format worked");
+  GST_WARNING ("set_f.");
   return TRUE;
 }
 
@@ -785,9 +819,9 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   proc_params.progressive_frame = dispinfo->progressive_frame;
   proc_params.top_field_first = dispinfo->top_field_first;
   proc_params.unpaired_field = dispinfo->repeat_first_field == -1;
-  proc_params.output_stream = nvdec->cuda_context->cudaStream;
+  proc_params.output_stream = nvdec->cudaStream;
 
-  if (!cuda_OK (cuvidCtxLock (nvdec->cuda_context->lock, 0))) {
+  if (!cuda_OK (cuvidCtxLock (nvdec->lock, 0))) {
     GST_WARNING_OBJECT (nvdec, "failed to lock CUDA context");
     return;
   }
@@ -807,12 +841,12 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   mcpy2d.dstHost = dst_host;
   mcpy2d.Height = nvdec->height;
 
-  cuCtxPushCurrent (nvdec->cuda_context->context);
+  cuCtxPushCurrent (nvdec->context);
   //TODO there really only needs to be one memcpy
   // Copy the Y luminance
   //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
-  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cuda_context->cudaStream))){
-    GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed");
+  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cudaStream))){
+    GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed Y");
   }
 
     // Copy the UV
@@ -820,11 +854,11 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
     mcpy2d.dstHost = (void*)(dst_host + mcpy2d.dstPitch * mcpy2d.Height);
     mcpy2d.Height = nvdec->height / 2; //TODO this assumes 420, which might not be the case for jpeg!
   //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
-  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cuda_context->cudaStream))){
-    GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed");
+  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cudaStream))) {
+    GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed UV");
   }
 
-  if (!cuda_OK (cuStreamSynchronize (nvdec->cuda_context->cudaStream))) {
+  if (!cuda_OK (cuStreamSynchronize (nvdec->cudaStream))) {
       GST_WARNING_OBJECT (nvdec, "Failed to syncronize the cuda stream");
   }
   cuCtxPopCurrent (NULL);
@@ -833,7 +867,7 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
     GST_WARNING_OBJECT (nvdec, "failed to unmap CUDA video frame");
 
 unlock_cuda_context:
-  if (!cuda_OK (cuvidCtxUnlock (nvdec->cuda_context->lock, 0)))
+  if (!cuda_OK (cuvidCtxUnlock (nvdec->lock, 0)))
     GST_WARNING_OBJECT (nvdec, "failed to unlock CUDA context");
 }
 
@@ -858,6 +892,7 @@ handle_pending_frames (GstNvDec * nvdec)
   GstMemory *mem;
 #endif
   GstFlowReturn ret = GST_FLOW_OK;
+  GST_DEBUG ("In pending frames");
 
   /* find the oldest unused, unfinished frame */
   pending_frames = list = gst_video_decoder_get_frames (decoder);
@@ -875,6 +910,7 @@ handle_pending_frames (GstNvDec * nvdec)
           (GstNvDecQueueItem *) g_async_queue_try_pop (nvdec->decode_queue))) {
     switch (item->type) {
       case GST_NVDEC_QUEUE_ITEM_TYPE_SEQUENCE:
+        GST_DEBUG ("Sequence");
         if (!nvdec->decoder) {
           GST_ERROR_OBJECT (nvdec, "no decoder");
           ret = GST_FLOW_ERROR;
@@ -886,10 +922,12 @@ handle_pending_frames (GstNvDec * nvdec)
         height = format->display_area.bottom - format->display_area.top;
         fps_n = format->frame_rate.numerator;
         fps_d = MAX (1, format->frame_rate.denominator);
+        GST_DEBUG ("Sequence A");
 
         if (!gst_pad_has_current_caps (GST_VIDEO_DECODER_SRC_PAD (decoder))
             || width != nvdec->width || height != nvdec->height
             || fps_n != nvdec->fps_n || fps_d != nvdec->fps_d) {
+          GST_DEBUG ("Sequence B");
           nvdec->width = width;
           nvdec->height = height;
           nvdec->fps_n = fps_n;
@@ -898,6 +936,7 @@ handle_pending_frames (GstNvDec * nvdec)
           state = gst_video_decoder_set_output_state (decoder,
               GST_VIDEO_FORMAT_NV12, nvdec->width, nvdec->height,
               nvdec->input_state);
+          GST_DEBUG ("Sequence C");
           state->caps = gst_caps_new_simple ("video/x-raw",
               "format", G_TYPE_STRING, "NV12",
               "width", G_TYPE_INT, nvdec->width,
@@ -906,24 +945,28 @@ handle_pending_frames (GstNvDec * nvdec)
               "interlace-mode", G_TYPE_STRING, format->progressive_sequence
               ? "progressive" : "interleaved",
               "texture-target", G_TYPE_STRING, "2D", NULL);
+          GST_DEBUG ("Sequence D");
 #if USE_GL
           gst_caps_set_features (state->caps, 0,
               gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL));
 #endif
           gst_video_codec_state_unref (state);
 
+          GST_DEBUG ("Sequence E");
           if (!gst_video_decoder_negotiate (decoder)) {
+              GST_DEBUG ("Sequence F");
             GST_WARNING_OBJECT (nvdec, "failed to negotiate with downstream");
             ret = GST_FLOW_NOT_NEGOTIATED;
-            g_print ("Not Negotiated\n");
+            GST_WARNING ("Not Negotiated\n");
             break;
           }
-            g_print ("Negotiated\n");
-        }
 
+          GST_DEBUG ("Negotiated");
+        }
         break;
 
       case GST_NVDEC_QUEUE_ITEM_TYPE_DECODE:
+        GST_DEBUG ("Decode");
         decode_params = (CUVIDPICPARAMS *) item->data;
         pending_frame = pending_frames->data;
         frame_number = decode_params->CurrPicIdx + 1;
@@ -944,6 +987,7 @@ handle_pending_frames (GstNvDec * nvdec)
         break;
 
       case GST_NVDEC_QUEUE_ITEM_TYPE_DISPLAY:
+        GST_DEBUG ("Display");
         dispinfo = (CUVIDPARSERDISPINFO *) item->data;
         for (pending_frame = NULL, tmp = list; !pending_frame && tmp;
             tmp = tmp->next) {
@@ -976,11 +1020,14 @@ handle_pending_frames (GstNvDec * nvdec)
         }
         latency -= pending_frame->duration;
 
+        GST_DEBUG ("alloc output");
         ret = gst_video_decoder_allocate_output_frame (decoder, pending_frame);
         if (ret != GST_FLOW_OK) {
+          GST_DEBUG ("err'd");
           GST_WARNING_OBJECT (nvdec, "failed to allocate output frame");
           break;
         }
+        GST_DEBUG ("alloced output");
 
 #if USE_GL
         num_resources = gst_buffer_n_memory (pending_frame->output_buffer);
@@ -1042,6 +1089,7 @@ handle_pending_frames (GstNvDec * nvdec)
   g_list_free_full (list, (GDestroyNotify) gst_video_codec_frame_unref);
 
   //g_print("Done handling frame %s\n", gst_flow_get_name(ret));
+  GST_DEBUG ("pending frames done");
   return ret;
 }
 
@@ -1076,6 +1124,7 @@ gst_nvdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   gst_buffer_unmap (frame->input_buffer, &map_info);
   gst_video_codec_frame_unref (frame);
 
+  GST_WARNING ("a");
   return handle_pending_frames (nvdec);
 }
 
@@ -1115,6 +1164,35 @@ gst_nvdec_drain (GstVideoDecoder * decoder)
     GST_WARNING_OBJECT (nvdec, "parser failed");
 
   return handle_pending_frames (nvdec);
+}
+
+void gst_nvdec_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
+{
+    GstNvDec *nvdec = GST_NVDEC (object);
+    switch (prop_id) {
+    case PROP_CTX:
+        nvdec->did_make_context = FALSE;
+        uint64_t ctx_uint = g_value_get_uint64 (value);
+        nvdec->context = (CUcontext)ctx_uint; //TODO this looks real fucking dangerous...
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+        break;
+    }
+}
+
+void gst_nvdec_get_property (GObject * object, guint prop_id, GValue * value, GParamSpec * pspec)
+{
+    GstNvDec *nvdec = GST_NVDEC (object);
+    switch (prop_id) {
+    case PROP_CTX:
+        g_value_set_uint64 (value, (guint64)nvdec->context);
+        //TODO this looks real fucking dangerous...
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+        break;
+    }
 }
 
 #if USE_GL

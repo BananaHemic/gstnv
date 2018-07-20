@@ -34,26 +34,6 @@
 G_BEGIN_DECLS
 #define USE_GL 0
 
-typedef struct _GstNvDecCudaContext GstNvDecCudaContext;
-typedef struct _GstNvDecCudaContextClass GstNvDecCudaContextClass;
-
-struct _GstNvDecCudaContext
-{
-  GObject parent;
-
-  CUcontext context;
-  CUvideoctxlock lock;
-  CUstream cudaStream;
-};
-
-struct _GstNvDecCudaContextClass
-{
-  GObjectClass parent_class;
-};
-
-GType gst_nvdec_cuda_context_get_type (void);
-
-
 #define GST_TYPE_NVDEC          (gst_nvdec_get_type())
 #define GST_NVDEC(obj)          (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_NVDEC, GstNvDec))
 #define GST_NVDEC_CLASS(klass)  (G_TYPE_CHECK_CLASS_CAST((klass), GST_TYPE_NVDEC, GstNvDecClass))
@@ -67,6 +47,11 @@ struct _GstNvDec
 {
   GstVideoDecoder parent;
 
+  gboolean did_make_context;
+  CUcontext context;
+  CUvideoctxlock lock;
+  CUstream cudaStream;
+
   gboolean use_gl_output;
 #if USE_GL
   GstGLDisplay *gl_display;
@@ -74,7 +59,6 @@ struct _GstNvDec
   GstGLContext *other_gl_context;
 #endif
 
-  GstNvDecCudaContext *cuda_context;
   CUvideoparser parser;
   CUvideodecoder decoder;
   GAsyncQueue *decode_queue;
