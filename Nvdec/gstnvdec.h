@@ -68,6 +68,7 @@ struct _GstNvDec
   guint height;
   guint fps_n;
   guint fps_d;
+  guint stride;
   GstClockTime min_latency;
   GstVideoCodecState *input_state;
 };

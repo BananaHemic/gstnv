@@ -833,34 +833,42 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   }
 
   mcpy2d.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+  mcpy2d.srcDevice = dptr;
   mcpy2d.srcPitch = pitch;
   mcpy2d.dstMemoryType = CU_MEMORYTYPE_HOST;
-  mcpy2d.dstPitch = nvdec->width;
-  mcpy2d.WidthInBytes = nvdec->width;
-  mcpy2d.srcDevice = dptr;
+  mcpy2d.dstPitch = nvdec->stride;
   mcpy2d.dstHost = dst_host;
-  mcpy2d.Height = nvdec->height;
+  mcpy2d.WidthInBytes = nvdec->width;
+  //mcpy2d.Height = nvdec->height;
+  mcpy2d.Height = nvdec->height + nvdec->height / 2;
+  GST_DEBUG ("Copying %i pitch to %i pitch", mcpy2d.srcPitch, mcpy2d.dstPitch);
 
   cuCtxPushCurrent (nvdec->context);
-  //TODO there really only needs to be one memcpy
-  // Copy the Y luminance
-  //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
+  // Copy the Y and UV planes
+  //if (!cuda_OK (cuMemcpy2D(&mcpy2d))){
   if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cudaStream))){
     GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed Y");
   }
+  if (!cuda_OK (cuStreamSynchronize (nvdec->cudaStream))) {
+      GST_WARNING_OBJECT (nvdec, "Failed to syncronize the cuda stream");
+  }
+  /*
+  CUDA_MEMCPY2D v2 = mcpy2d;
+  // Copy the UV
+  v2.dstPitch = nvdec->uv_stride;
+  v2.srcDevice = (CUdeviceptr)(dptr + mcpy2d.srcPitch * mcpy2d.Height);
+  v2.dstHost = (void*)(dst_host + mcpy2d.dstPitch * mcpy2d.Height);
+  v2.Height = nvdec->height / 2; //TODO this assumes 420, which might not be the case for jpeg!
 
-    // Copy the UV
-    mcpy2d.srcDevice = (CUdeviceptr)(dptr + mcpy2d.srcPitch * mcpy2d.Height);
-    mcpy2d.dstHost = (void*)(dst_host + mcpy2d.dstPitch * mcpy2d.Height);
-    mcpy2d.Height = nvdec->height / 2; //TODO this assumes 420, which might not be the case for jpeg!
-  //if (!cuda_OK (cuMemcpy2D (&mcpy2d))){
-  if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cudaStream))) {
+  //if (!cuda_OK (cuMemcpy2D(&mcpy2d))) {
+  if (!cuda_OK (cuMemcpy2DAsync (&v2, nvdec->cudaStream))) {
     GST_WARNING_OBJECT (nvdec, "memcpy to mapped array failed UV");
   }
 
   if (!cuda_OK (cuStreamSynchronize (nvdec->cudaStream))) {
       GST_WARNING_OBJECT (nvdec, "Failed to syncronize the cuda stream");
   }
+  */
   cuCtxPopCurrent (NULL);
 
   if (!cuda_OK (cuvidUnmapVideoFrame (nvdec->decoder, dptr)))
@@ -945,6 +953,8 @@ handle_pending_frames (GstNvDec * nvdec)
               "interlace-mode", G_TYPE_STRING, format->progressive_sequence
               ? "progressive" : "interleaved",
               "texture-target", G_TYPE_STRING, "2D", NULL);
+          nvdec->stride = state->info.stride[0];
+          GST_DEBUG ("Stride is %i", nvdec->stride);
           GST_DEBUG ("Sequence D");
 #if USE_GL
           gst_caps_set_features (state->caps, 0,
@@ -1052,6 +1062,7 @@ handle_pending_frames (GstNvDec * nvdec)
 #endif
         GstMapInfo map = GST_MAP_INFO_INIT;
         gst_buffer_map (pending_frame->output_buffer, &map, GST_MAP_WRITE);
+        GST_DEBUG ("Copying %d bytes to system", (int)map.size);
         copy_video_frame_to_system (nvdec, dispinfo, map.data);
         gst_buffer_unmap (pending_frame->output_buffer, &map);
 
