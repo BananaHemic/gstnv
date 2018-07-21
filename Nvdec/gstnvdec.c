@@ -491,7 +491,8 @@ gst_nvdec_start (GstVideoDecoder * decoder)
           GST_WARNING ("Ctx is not current we have " G_GUINT64_FORMAT, current);
   }
 
-  if (!cuda_OK (cuStreamCreate (&(nvdec->cudaStream), CU_STREAM_NON_BLOCKING)))
+  //if (!cuda_OK (cuStreamCreate (&(nvdec->cudaStream), CU_STREAM_NON_BLOCKING)))
+  if (!cuda_OK (cuStreamCreate (&(nvdec->cudaStream), CU_STREAM_DEFAULT)))
       GST_ERROR ("Failed to create the cuda stream");
   GST_DEBUG ("Made cuda stream");
 
@@ -844,6 +845,9 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   GST_DEBUG ("Copying %i pitch to %i pitch", mcpy2d.srcPitch, mcpy2d.dstPitch);
 
   cuCtxPushCurrent (nvdec->context);
+  //if (!cuda_OK (cuStreamSynchronize (nvdec->cudaStream))) {
+      //GST_WARNING_OBJECT (nvdec, "Failed to syncronize the cuda stream");
+  //}
   // Copy the Y and UV planes
   //if (!cuda_OK (cuMemcpy2D(&mcpy2d))){
   if (!cuda_OK (cuMemcpy2DAsync (&mcpy2d, nvdec->cudaStream))){
