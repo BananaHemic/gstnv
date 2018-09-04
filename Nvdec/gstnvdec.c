@@ -50,7 +50,8 @@ typedef enum
 enum
 {
     PROP_0,
-    PROP_CTX
+    PROP_CTX,
+    PROP_LOCK
 };
 
 typedef struct _GstNvDecQueueItem
@@ -316,6 +317,11 @@ gst_nvdec_class_init (GstNvDecClass * klass)
       g_param_spec_uint64 ("context", "context",
           "Cuda Context", 0, G_MAXUINT64, 0,
           (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_LOCK,
+      g_param_spec_uint64 ("lock", "lock",
+          "Cuda Context Lock", 0, G_MAXUINT64, 0,
+          (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -336,6 +342,7 @@ parser_sequence_callback (GstNvDec * nvdec, CUVIDEOFORMAT * format)
 
   width = format->display_area.right - format->display_area.left;
   height = format->display_area.bottom - format->display_area.top;
+  //GST_DEBUG ("Parser callback");
   GST_DEBUG_OBJECT (nvdec, "width: %u, height: %u", width, height);
 
   if (!nvdec->decoder || (nvdec->width != width || nvdec->height != height)) {
@@ -408,7 +415,7 @@ static gboolean
 parser_decode_callback (GstNvDec * nvdec, CUVIDPICPARAMS * params)
 {
   GstNvDecQueueItem *item;
-  //GST_DEBUG ("parser callback");
+  //GST_DEBUG ("decode callback");
 
   GST_DEBUG_OBJECT (nvdec, "decoded picture index: %u", params->CurrPicIdx);
 
@@ -435,6 +442,7 @@ static gboolean
 parser_display_callback (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo)
 {
   GstNvDecQueueItem *item;
+  //GST_DEBUG ("display callback");
 
   GST_DEBUG_OBJECT (nvdec, "display picture index: %u", dispinfo->picture_index);
 
@@ -468,7 +476,7 @@ gst_nvdec_start (GstVideoDecoder * decoder)
       if (!cuda_OK (cuCtxCreate (&nvdec->context, CU_CTX_SCHED_AUTO, cuDevice)))
           GST_ERROR ("failed to create CUDA context");
       nvdec->did_make_context = TRUE;
-      GST_WARNING ("Made ctx, size %i %" G_GUINT64_FORMAT " device #%i", sizeof (CUcontext), nvdec->context, cuDevice);
+      GST_DEBUG ("Made ctx, size %i %" G_GUINT64_FORMAT " device #%i", sizeof (CUcontext), nvdec->context, cuDevice);
   }
   else {
       CUcontext current;
@@ -477,18 +485,18 @@ gst_nvdec_start (GstVideoDecoder * decoder)
       if (current == nvdec->context)
           GST_DEBUG ("Ctx is current");
       else
-          GST_WARNING ("Ctx is not current we have %" G_GUINT64_FORMAT, current);
+          GST_DEBUG ("Ctx is not current we have %" G_GUINT64_FORMAT, current);
 
       if (!cuda_OK (cuCtxPushCurrent (nvdec->context))) {
           GST_ERROR ("Failed pushing provided context");
           return FALSE;
       }
-      GST_WARNING ("Using provided context of %" G_GUINT64_FORMAT, nvdec->context);
+      GST_DEBUG ("Using provided context of %" G_GUINT64_FORMAT, nvdec->context);
       cuCtxGetCurrent (&current);
       if (current == nvdec->context)
           GST_DEBUG ("Ctx is current");
       else
-          GST_WARNING ("Ctx is not current we have " G_GUINT64_FORMAT, current);
+          GST_WARNING ("Ctx is still not current we have " G_GUINT64_FORMAT, current);
   }
 
   //if (!cuda_OK (cuStreamCreate (&(nvdec->cudaStream), CU_STREAM_NON_BLOCKING)))
@@ -498,14 +506,21 @@ gst_nvdec_start (GstVideoDecoder * decoder)
 
   unsigned int version = 0;
   cuCtxGetApiVersion (nvdec->context, &version);
-  GST_WARNING ("Using version %u", version);
+  GST_DEBUG ("Using version %u", version);
 
   if (!cuda_OK (cuCtxPopCurrent (NULL)))
       GST_ERROR ("failed to pop current CUDA context");
 
-  if (!cuda_OK (cuvidCtxLockCreate (&nvdec->lock, nvdec->context)))
-      GST_ERROR ("failed to create CUDA context lock");
-  GST_WARNING ("Created lock");
+
+  if (nvdec->lock == NULL) {
+      if (!cuda_OK (cuvidCtxLockCreate (&nvdec->lock, nvdec->context)))
+          GST_ERROR ("failed to create CUDA context lock");
+      GST_DEBUG ("Made lock with size %i", sizeof (nvdec->lock));
+      nvdec->did_make_lock = TRUE;
+  }
+  else {
+      GST_DEBUG ("Using provided lock");
+  }
 
   nvdec->decode_queue = g_async_queue_new ();
 
@@ -563,12 +578,13 @@ gst_nvdec_stop (GstVideoDecoder * decoder)
   if (!maybe_destroy_decoder_and_parser (nvdec))
     return FALSE;
 
-  if (nvdec->lock) {
+  if (nvdec->lock && nvdec->did_make_lock) {
     GST_DEBUG ("destroying CUDA context lock");
     if (cuda_OK (cuvidCtxLockDestroy (nvdec->lock)))
       nvdec->lock = NULL;
     else
       GST_ERROR ("failed to destroy CUDA context lock");
+    nvdec->did_make_lock = FALSE;
   }
 
   if (nvdec->cudaStream) {
@@ -621,6 +637,8 @@ gst_nvdec_stop (GstVideoDecoder * decoder)
     g_async_queue_unref (nvdec->decode_queue);
     nvdec->decode_queue = NULL;
   }
+  g_list_free_full (nvdec->decode_frames_pending_drop, (GDestroyNotify) gst_video_codec_frame_unref);
+  g_list_free_full (nvdec->display_frames_pending_drop, (GDestroyNotify) gst_video_codec_frame_unref);
 
   return TRUE;
 }
@@ -629,7 +647,6 @@ static gboolean
 gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
-  GST_WARNING ("set_f");
 
   GstStructure *s;
   const gchar *caps_name;
@@ -734,7 +751,6 @@ gst_nvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   }
 
   GST_DEBUG_OBJECT (nvdec, "Set format worked");
-  GST_WARNING ("set_f.");
   return TRUE;
 }
 
@@ -815,7 +831,7 @@ copy_video_frame_to_system (GstNvDec * nvdec, CUVIDPARSERDISPINFO * dispinfo, gu
   guint pitch;
   CUDA_MEMCPY2D mcpy2d = { 0, };
 
-  GST_LOG_OBJECT (nvdec, "picture index: %u", dispinfo->picture_index);
+  GST_LOG_OBJECT (nvdec, "copying picture index: %u", dispinfo->picture_index);
 
   proc_params.progressive_frame = dispinfo->progressive_frame;
   proc_params.top_field_first = dispinfo->top_field_first;
@@ -908,15 +924,33 @@ handle_pending_frames (GstNvDec * nvdec)
 
   /* find the oldest unused, unfinished frame */
   pending_frames = list = gst_video_decoder_get_frames (decoder);
+
+  /* Print all waiting frames
+  for (GList *pnd = list; pnd != NULL; pnd = pnd->next) {
+    GstVideoCodecFrame *frame = pnd->data;
+    guint num =
+        GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data (frame));
+    GST_DEBUG ("%" G_GUINT32_FORMAT ": %" GST_TIME_FORMAT,
+        num, GST_TIME_ARGS(frame->pts));
+  }
+  */
+
+  // Get the first frame with a 0 frame number
+  // Also measure the latency
   for (; pending_frames; pending_frames = pending_frames->next) {
     pending_frame = pending_frames->data;
     frame_number =
         GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data (pending_frame));
     if (!frame_number)
-      break;
+        break;
     latency += pending_frame->duration;
   }
+  // TODO currently we won't iterate if there are no pending
+  // frames waiting for decode. Even if there are
+  // frames waiting to be displayed or frames
+  // that are ready to be dropped
 
+  // Keep iterating until we error, or have no more pending frames
   while (ret == GST_FLOW_OK && pending_frames
       && (item =
           (GstNvDecQueueItem *) g_async_queue_try_pop (nvdec->decode_queue))) {
@@ -980,10 +1014,27 @@ handle_pending_frames (GstNvDec * nvdec)
         break;
 
       case GST_NVDEC_QUEUE_ITEM_TYPE_DECODE:
-        GST_DEBUG ("Decode");
+        // If we have a decode item, then use the oldest
+        // frame without a frame number
         decode_params = (CUVIDPICPARAMS *) item->data;
-        pending_frame = pending_frames->data;
+
+        // First check if this is a frame that needs to be dropped
+        if (nvdec->decode_frames_pending_drop != NULL) {
+            //guint len = g_list_length (nvdec->decode_frames_pending_drop);
+            pending_frame = nvdec->decode_frames_pending_drop->data;
+            nvdec->decode_frames_pending_drop = g_list_remove (nvdec->decode_frames_pending_drop, pending_frame);
+            //GST_DEBUG_OBJECT (nvdec, "Will drop decode frame, len: %" G_GUINT32_FORMAT, len);
+            // Add this frame to the list of display frames ready to be dropped
+            nvdec->display_frames_pending_drop = g_list_append (nvdec->display_frames_pending_drop, pending_frame);
+        }
+        else {
+            pending_frame = pending_frames->data;
+            pending_frames = pending_frames->next;
+        }
+
         frame_number = decode_params->CurrPicIdx + 1;
+        GST_DEBUG ("Decode %" G_GUINT32_FORMAT, frame_number);
+
         gst_video_codec_frame_set_user_data (pending_frame,
             GUINT_TO_POINTER (frame_number), NULL);
 
@@ -995,35 +1046,67 @@ handle_pending_frames (GstNvDec * nvdec)
               nvdec->fps_n ? GST_SECOND * nvdec->fps_d / nvdec->fps_n : 0;
         }
         latency += pending_frame->duration;
-
-        pending_frames = pending_frames->next;
+        GST_DEBUG_OBJECT (nvdec, "Done with decode");
 
         break;
 
       case GST_NVDEC_QUEUE_ITEM_TYPE_DISPLAY:
-        GST_DEBUG ("Display");
+          // If we get a display item, find the previously
+          // set pending frame using the frame number
         dispinfo = (CUVIDPARSERDISPINFO *) item->data;
-        for (pending_frame = NULL, tmp = list; !pending_frame && tmp;
+        GST_DEBUG ("Display %" G_GUINT32_FORMAT, dispinfo->picture_index + 1);
+        pending_frame = NULL;
+
+        // First, try to find the display frame in the display frames ready to be dropped
+        for (tmp = nvdec->display_frames_pending_drop;
+            !pending_frame && tmp;
             tmp = tmp->next) {
-          frame_number =
-              GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data
-              (tmp->data));
-          if (frame_number == dispinfo->picture_index + 1)
-            pending_frame = tmp->data;
+            frame_number =
+                GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data
+                (tmp->data));
+            //GST_DEBUG ("drop display #%" G_GUINT32_FORMAT, frame_number);
+            if (frame_number == dispinfo->picture_index + 1)
+                pending_frame = tmp->data;
         }
-        if (!pending_frame) {
-          GST_INFO_OBJECT (nvdec, "no frame with number %u",
-              dispinfo->picture_index + 1);
-          break;
+        // If we found the frame, remove it from the list
+        if (pending_frame) {
+            GST_DEBUG_OBJECT (nvdec, "Using dropped frame");
+            nvdec->display_frames_pending_drop = g_list_remove (nvdec->display_frames_pending_drop, pending_frame);
+            // We're now done with this frame, so just unref
+            gst_video_codec_frame_unref (pending_frame);
+            break;
         }
 
-        if (dispinfo->timestamp != pending_frame->pts) {
-          GST_INFO_OBJECT (nvdec,
-              "timestamp mismatch, diff: %" GST_STIME_FORMAT,
-              GST_STIME_ARGS (GST_CLOCK_DIFF (dispinfo->timestamp,
-                      pending_frame->pts)));
-          pending_frame->pts = dispinfo->timestamp;
+        // If we didn't find the frame in the dropping display list, check
+        // pending_frames
+        for (pending_frame = NULL, tmp = list; !pending_frame && tmp;
+            tmp = tmp->next) {
+            frame_number =
+                GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data
+                (tmp->data));
+            if (frame_number == dispinfo->picture_index + 1)
+                pending_frame = tmp->data;
         }
+
+        // If we still did not find the frame, then an error has likely occurred
+        if (!pending_frame) {
+            GST_WARNING_OBJECT (nvdec, "no frame with number %u",
+                dispinfo->picture_index + 1);
+            break;
+        }
+
+        // Make sure the timestamps are the same
+        if (dispinfo->timestamp != pending_frame->pts) {
+            GST_WARNING_OBJECT (nvdec,
+                "timestamp mismatch, frame: %" GST_TIME_FORMAT
+                " nvdisp: %" GST_TIME_FORMAT,
+                GST_TIME_ARGS (pending_frame->pts),
+                GST_TIME_ARGS (dispinfo->timestamp));
+          //pending_frame->pts = dispinfo->timestamp;
+        }
+          GST_DEBUG_OBJECT (nvdec,
+              "displaying ts: %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (pending_frame->pts));
 
         if (latency > nvdec->min_latency) {
           nvdec->min_latency = latency;
@@ -1034,14 +1117,11 @@ handle_pending_frames (GstNvDec * nvdec)
         }
         latency -= pending_frame->duration;
 
-        GST_DEBUG ("alloc output");
         ret = gst_video_decoder_allocate_output_frame (decoder, pending_frame);
         if (ret != GST_FLOW_OK) {
-          GST_DEBUG ("err'd");
           GST_WARNING_OBJECT (nvdec, "failed to allocate output frame");
           break;
         }
-        GST_DEBUG ("alloced output");
 
 #if USE_GL
         num_resources = gst_buffer_n_memory (pending_frame->output_buffer);
@@ -1065,7 +1145,10 @@ handle_pending_frames (GstNvDec * nvdec)
         g_free (resources);
 #endif
         GstMapInfo map = GST_MAP_INFO_INIT;
-        gst_buffer_map (pending_frame->output_buffer, &map, GST_MAP_WRITE);
+        if (!gst_buffer_map (pending_frame->output_buffer, &map, GST_MAP_WRITE)) {
+            GST_WARNING_OBJECT (nvdec, "Failed to map for display!");
+            break;
+        }
         GST_DEBUG ("Copying %d bytes to system", (int)map.size);
         copy_video_frame_to_system (nvdec, dispinfo, map.data);
         gst_buffer_unmap (pending_frame->output_buffer, &map);
@@ -1101,6 +1184,8 @@ handle_pending_frames (GstNvDec * nvdec)
     g_slice_free (GstNvDecQueueItem, item);
   }
 
+  // getting the pending frames from the base class refs them,
+  // so we unref everything here
   g_list_free_full (list, (GDestroyNotify) gst_video_codec_frame_unref);
 
   //g_print("Done handling frame %s\n", gst_flow_get_name(ret));
@@ -1115,7 +1200,9 @@ gst_nvdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   GstMapInfo map_info = GST_MAP_INFO_INIT;
   CUVIDSOURCEDATAPACKET packet = { 0, };
 
-  GST_LOG_OBJECT (nvdec, "handle frame");
+  GST_LOG_OBJECT (nvdec,
+      "handling frame ts: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (frame->pts));
 
   gst_video_codec_frame_set_user_data (frame, GUINT_TO_POINTER (0), NULL);
 
@@ -1130,8 +1217,10 @@ gst_nvdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   packet.timestamp = frame->pts;
   packet.flags = CUVID_PKT_TIMESTAMP;
 
-  if (GST_BUFFER_IS_DISCONT (frame->input_buffer))
-    packet.flags |= CUVID_PKT_DISCONTINUITY;
+  if (GST_BUFFER_IS_DISCONT (frame->input_buffer)) {
+      GST_DEBUG_OBJECT (nvdec, "Adding discontinuity");
+      packet.flags |= CUVID_PKT_DISCONTINUITY;
+  }
 
   if (!cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
     GST_WARNING_OBJECT (nvdec, "parser failed");
@@ -1139,7 +1228,6 @@ gst_nvdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   gst_buffer_unmap (frame->input_buffer, &map_info);
   gst_video_codec_frame_unref (frame);
 
-  GST_WARNING ("a");
   return handle_pending_frames (nvdec);
 }
 
@@ -1147,19 +1235,53 @@ static gboolean
 gst_nvdec_flush (GstVideoDecoder * decoder)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
-  CUVIDSOURCEDATAPACKET packet = { 0, };
-
   GST_DEBUG_OBJECT (nvdec, "flush");
 
-  packet.payload_size = 0;
-  packet.payload = NULL;
-  packet.flags = CUVID_PKT_ENDOFSTREAM;
+  // Nvidia doesn't let us drop frames that are "in-flight"
+  // So to flush we just note the frames that are currently in flight
+  // and we drop them once they've been fully decoded
+  // we also notify the base class that we're done with the
+  // current pending frames
 
-  if (!cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
-    GST_WARNING_OBJECT (nvdec, "parser failed");
+  GList* pending_frames = gst_video_decoder_get_frames (decoder);
+  GList* list = pending_frames;
+  for (; pending_frames != NULL; pending_frames = pending_frames->next) {
+      // Keep track of the frames that are being dropped
+      GstVideoCodecFrame* frame = pending_frames->data;
+      guint frame_number =
+          GPOINTER_TO_UINT (gst_video_codec_frame_get_user_data (frame));
+
+      // If the frame number is 0, this frame is pending decode
+      // if it has a frame number, it's pending display
+      if (frame_number == 0) {
+          nvdec->decode_frames_pending_drop = g_list_append (nvdec->decode_frames_pending_drop, frame);
+          GST_DEBUG_OBJECT (nvdec, "Adding to decode drop: %" GST_TIME_FORMAT,
+              GST_TIME_ARGS(frame->pts));
+      }
+      else {
+          nvdec->display_frames_pending_drop = g_list_append (nvdec->display_frames_pending_drop, frame);
+          GST_DEBUG_OBJECT (nvdec, "Adding to display drop: %" G_GUINT32_FORMAT
+              " %" GST_TIME_FORMAT,
+              frame_number,
+              GST_TIME_ARGS(frame->pts));
+      }
+
+      // drop the frame, but keep a ref for until it's fully decoded
+      gst_video_codec_frame_ref (frame);
+      gst_video_decoder_release_frame (decoder, frame);
+  }
+  // Clear out our list (GstVideoDecoder gives us a ref'd copy)
+  g_list_free (list);
+  //guint decode_len = g_list_length (nvdec->decode_frames_pending_drop);
+  //GST_DEBUG_OBJECT (nvdec, "pending drop decode frame len: %" G_GUINT32_FORMAT, decode_len);
+  //if (decode_len > 0) {
+      //GstVideoCodecFrame* frame_1 = nvdec->decode_frames_pending_drop->data;
+      //GST_DEBUG_OBJECT (nvdec, "decode pending drop 1st pts: %" GST_TIME_FORMAT,
+          //GST_TIME_ARGS (frame_1->pts));
+  //}
 
   handle_pending_frames (nvdec);
-
+  GST_DEBUG_OBJECT (nvdec, "flushed");
   return TRUE;
 }
 
@@ -1167,18 +1289,18 @@ static GstFlowReturn
 gst_nvdec_drain (GstVideoDecoder * decoder)
 {
   GstNvDec *nvdec = GST_NVDEC (decoder);
-  CUVIDSOURCEDATAPACKET packet = { 0, };
-
+  //CUVIDSOURCEDATAPACKET packet = { 0, };
   GST_DEBUG_OBJECT (nvdec, "draining decoder");
+  //packet.payload_size = 0;
+  //packet.payload = NULL;
+  //packet.flags = CUVID_PKT_ENDOFSTREAM;
 
-  packet.payload_size = 0;
-  packet.payload = NULL;
-  packet.flags = CUVID_PKT_ENDOFSTREAM;
+  //if (nvdec->parser && !cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
+    //GST_WARNING_OBJECT (nvdec, "parser failed");
 
-  if (nvdec->parser && !cuda_OK (cuvidParseVideoData (nvdec->parser, &packet)))
-    GST_WARNING_OBJECT (nvdec, "parser failed");
-
-  return handle_pending_frames (nvdec);
+  GstFlowReturn ret = handle_pending_frames (nvdec);
+  GST_DEBUG_OBJECT (nvdec, "decoder drained");
+  return ret;
 }
 
 void gst_nvdec_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
@@ -1189,6 +1311,11 @@ void gst_nvdec_set_property (GObject * object, guint prop_id, const GValue * val
         nvdec->did_make_context = FALSE;
         uint64_t ctx_uint = g_value_get_uint64 (value);
         nvdec->context = (CUcontext)ctx_uint; //TODO this looks real fucking dangerous...
+        break;
+    case PROP_LOCK:
+        nvdec->did_make_lock = FALSE;
+        uint64_t lock_uint = g_value_get_uint64 (value);
+        nvdec->lock = (CUvideoctxlock)lock_uint; //TODO this looks real fucking dangerous...
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1202,6 +1329,10 @@ void gst_nvdec_get_property (GObject * object, guint prop_id, GValue * value, GP
     switch (prop_id) {
     case PROP_CTX:
         g_value_set_uint64 (value, (guint64)nvdec->context);
+        //TODO this looks real fucking dangerous...
+        break;
+    case PROP_LOCK:
+        g_value_set_uint64 (value, (guint64)nvdec->lock);
         //TODO this looks real fucking dangerous...
         break;
     default:

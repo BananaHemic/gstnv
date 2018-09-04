@@ -48,6 +48,7 @@ struct _GstNvDec
   GstVideoDecoder parent;
 
   gboolean did_make_context;
+  gboolean did_make_lock;
   CUcontext context;
   CUvideoctxlock lock;
   CUstream cudaStream;
@@ -62,6 +63,13 @@ struct _GstNvDec
   CUvideoparser parser;
   CUvideodecoder decoder;
   GAsyncQueue *decode_queue;
+
+  // All the frames that are waiting to be decoded
+  // that need to be dropped
+  GList* decode_frames_pending_drop;
+  // All the frames that are waiting to be displayed
+  // that need to be dropped
+  GList* display_frames_pending_drop;
 
   guint num_decode_surfaces;
   guint width;
