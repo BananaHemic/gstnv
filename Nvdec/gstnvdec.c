@@ -1272,15 +1272,7 @@ gst_nvdec_flush (GstVideoDecoder * decoder)
   }
   // Clear out our list (GstVideoDecoder gives us a ref'd copy)
   g_list_free (list);
-  //guint decode_len = g_list_length (nvdec->decode_frames_pending_drop);
-  //GST_DEBUG_OBJECT (nvdec, "pending drop decode frame len: %" G_GUINT32_FORMAT, decode_len);
-  //if (decode_len > 0) {
-      //GstVideoCodecFrame* frame_1 = nvdec->decode_frames_pending_drop->data;
-      //GST_DEBUG_OBJECT (nvdec, "decode pending drop 1st pts: %" GST_TIME_FORMAT,
-          //GST_TIME_ARGS (frame_1->pts));
-  //}
 
-  handle_pending_frames (nvdec);
   GST_DEBUG_OBJECT (nvdec, "flushed");
   return TRUE;
 }
